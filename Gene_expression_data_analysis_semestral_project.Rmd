@@ -1,0 +1,1127 @@
+---
+title: "Semestral project"
+author:
+  - Simona Suhajova suhajovs@vscht.cz
+output:
+  rmdformats::readthedown:
+    highlight: "kate"
+    lightbox: true
+    thumbnails: true
+    gallery: true
+    toc_depth: 4
+    self_contained: true
+    number_sections: false
+    toc_collapsed: false
+    df_print: "paged"
+date: "`r Sys.Date()`"
+---
+
+```{r, child = here("_assets/custom.Rmd"), eval = TRUE}
+```
+
+```{css, echo = FALSE}
+.assay {
+  color: #FF7E7E;
+}
+
+.pData {
+  color: #BF7EBF;
+}
+
+.fData {
+  color: #7E7EFF;
+}
+```
+
+
+# Introduction to experiment
+
+Link to the experiment:
+https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-6909/
+
+Description of experiment
+The first step in the development of human colorectal cancer (CRC) is the aberrant hyperactivation of the Wnt signaling pathway, predominantly caused by inactivating mutations in the adenomatous polyposis coli (APC) gene which encodes an essential tumor suppressor. In order to identify genes affected by Apc loss, expression profiling of intestinal epithelium isolated from mice harboring the conditional allele of the gene was performed. The gene encoding transcriptional factor msh homeobox 1 (Msx1) displayed robust upregulation upon Apc inactivation. To characterize the gene signature in colon upon Msx1 depletion, colonic epithelium from mice harboring conditional alleles of Apc and Msx1 was isolated and the gene expression profile was compared with control mice harboring the conditional allele of Apc only.
+
+I downloaded and used the data from this experiment for my semestral project. See the file: README.md for more detailed information about files for this experiment.
+
+
+***
+
+# Libraries
+
+```{r, message = FALSE}
+
+library(dendextend)
+library(here)
+library(emo)
+library(tidyverse)
+library(glue)
+library(oligo)
+library(limma)
+library(ReportingTools)
+library(lattice)
+library(sva)
+library(patchwork) 
+library(stringr)
+library(ComplexHeatmap)
+library(clusterProfiler)
+library(DESeq2)
+library(magrittr)
+library(ggplot2)
+library(enrichplot)
+library(pathview)
+library(SPIA)
+
+library(affycoretools)
+library(mogene20sttranscriptcluster.db)
+
+source(here("report.R"))
+source(here("age_library.R"))
+```
+
+***
+
+# Config
+
+Input files:
+- defined variables for path to directory of semestral project and for path to directory of experimental data
+
+```{r}
+BASE_DIR <- here("semestral_project")
+DATA_DIR <- here(BASE_DIR, "data")
+
+EXPERIMENT_DATA_DIR <- here(DATA_DIR, "E-MTAB-6909")
+EXPERIMENT_SAMPLE_SHEET_FILE <- here(EXPERIMENT_DATA_DIR, "E-MTAB-6909.sdrf.txt")
+```
+
+
+
+
+***
+
+# Reading the data
+
+## Phenotypical data
+
+- loaded data from sample sheet file `semestral_project/data/E-MTAB-6909.sdrf.txt`
+- data preprocessing for later use
+
+```{r}
+# shortening name to plots
+shorterString <- function(x){
+  res <- x %>% str_replace("UMG_JANECKOVA1_", "")
+  res <- res %>% str_replace("MoGene-2_0_", "")
+  res <- res %>% str_replace("st_", "st")
+  return(res)
+}
+
+# create valid name for gene comparison - contrasts 
+validName <- function(x){
+  res <- gsub(" ", "_", x)
+  res <- res %>% str_replace("_in_Villin1_positive_cells", "")
+  print(res)
+  return (res)
+}
+
+```
+
+
+```{r}
+pheno_data <- readr::read_delim(EXPERIMENT_SAMPLE_SHEET_FILE, delim = "\t", progress = FALSE)
+pheno_data['sample_name'] <- apply(pheno_data['Assay Name'],1,shorterString)
+                  
+pheno_data<- pheno_data %>% dplyr::rename(factor_value_phenotype = `Factor Value[phenotype]`)
+pheno_data <- pheno_data %>% dplyr::mutate(factor_value_phenotype = dplyr::if_else(factor_value_phenotype == "wild type","control", factor_value_phenotype))
+pheno_data['factor_value_phenotype'] <- apply(pheno_data['factor_value_phenotype'],1,validName)
+
+pheno_data$factor_value_phenotype <- factor(pheno_data$factor_value_phenotype)
+pheno_data
+```
+
+- set `pheno_data` rownames according sample_name (I extract number from `Assay name`)
+
+```{r}
+pheno_data <- pheno_data %>% as.data.frame() %>%  magrittr::set_rownames(.$sample_name)
+pheno_data
+```
+
+## CEL files
+
+- loaded data from CEL files in directory `semestral_project/data/E-MTAB-6909`
+
+- it was necessary to install BiocManager 3.13 version
+```{r}
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install(version = "3.13")
+```
+
+```{r}
+cel_files <- glue("{EXPERIMENT_DATA_DIR}/{pheno_data$`Array Data File`}")
+raw_data <- read.celfiles(cel_files)
+```
+
+- stored data in the `raw_data` summary:
+
+```{r}
+# total 12 samples
+raw_data
+```
+
+- set `raw_data` rownames according `raw_data` row names
+
+```{r}
+sampleNames(raw_data) <- pheno_data$sample_name
+
+phenoData(raw_data)
+pData(raw_data)
+```
+
+- created `AnnotatedDataFrame`:
+
+```{r}
+pheno_data <- AnnotatedDataFrame(data = pheno_data)
+```
+
+- combined `pheno_data` with existing phenoData on raw_data:
+
+```{r}
+phenoData(raw_data) <- Biobase::combine(phenoData(raw_data), pheno_data)
+pData(raw_data) %>% head()
+```
+
+
+
+
+***
+
+# Technical quality control
+
+## Pseudo-image
+
+- pseudo-image plots are used to assess the spatial distribution of the data on the chips
+
+```{r}
+image(raw_data, which = 12, transfo = log2)
+```
+On the pseudo-image plot can be seen that most of this area is random noise (that's ok). On the right side is one bar of the same color, which can mean a technical problem (bad detecting od intesities, defective chip,...)
+But it would not have be a technical problem, it could be an unused field on chip, not all columns were used.
+
+
+## [MA plot](https://en.wikipedia.org/wiki/MA_plot)
+
+- intensities from one chip against the intensities on the other chip and then rotating them by 45 degrees
+
+-  MA for each combination of three samples:
+```{r}
+MAplot(raw_data[, 10:12], pairs = TRUE)
+```
+
+- summarise sample groups
+- image is in `semestral_project/images/ma_plot.png`
+
+```{r}
+png(file="images/ma_plot.png",width=1800, height=700)
+MAplot(raw_data, groups = factor(pData(raw_data)$sample_name), pairs = TRUE)
+dev.off()
+```
+
+MA plots look fine, the cloud of genes is around center (diagonal original).
+
+
+## Boxplots
+
+- boxplot of intensities
+
+```{r}
+nrow(raw_data)
+boxplot(raw_data,'all', nsample = nrow(raw_data))
+```
+
+Boxplots looks very similar, it could be assumed that the experiment went well.
+
+
+## Probe level model
+
+- statistical models - fit model on my data
+
+```{r}
+fit_plm <- fitProbeLevelModel(raw_data)
+```
+- plotting the intensities of the probes on a plot
+
+```{r}
+image(fit_plm, which = 12)
+# plotting residues with sign - noise
+image(fit_plm, which = 12, type = "sign.residuals")
+```
+
+This images look very similar to image early. We an see random noise and random error. The right bar was probably not used. (in middle is technical for zooming of machine/detector)
+It's look fine.
+
+## Relative log expression (RLE)
+
+- relative log expression - how is the quality of the chip
+- values on each chip are compared with the values on all chips (the mean is made)
+
+```{r}
+RLE(fit_plm)
+```
+The last samples is little bit different but it doesn't look like much difference, the boxplots are around the same value.
+
+
+## Normalized unscaled standard errors (NUSE)
+
+
+```{r}
+NUSE(fit_plm)
+```
+Those samples - their boxplots are around the value one, looks similar.
+
+From the results and assessments based on technical quality control, I would conclude that there is no batch effect.
+
+
+***
+
+# Normalization and probe annotation
+
+- for normalization was used the RMA method:
+```{r}
+norm_data <- rma(raw_data)
+```
+
+- I used a DB package [mogene20sttranscriptcluster.db](http://bioconductor.org/packages/release/data/annotation/html/mogene20sttranscriptcluster.db.html)
+corresponding to my chip to annotate the probes
+
+- the DB package can be download:
+```{r}
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# 
+# BiocManager::install("mogene20sttranscriptcluster.db")
+
+```
+
+- info about package `mogene20sttranscriptcluster.db`
+```{r}
+mogene20sttranscriptcluster.db
+```
+
+
+- selected data using list of keys + specification columns to return and what is keytype:
+```{r}
+feature_data <- AnnotationDbi::select(
+  mogene20sttranscriptcluster.db,
+  # Which columns we want to retrieve from DB.
+  columns = c("PROBEID", "ENSEMBL", "SYMBOL", "GENENAME", "ENTREZID"),
+  # Vector of keys to use. Each key has a matching row in columns.
+  keys = featureNames(norm_data),
+  # Our key type is ID of probe.
+  keytype = "PROBEID"
+)
+
+head(feature_data)
+```
+
+
+Some probes are targeting multiple genes:
+```{r}
+janitor::get_dupes(feature_data, PROBEID) %>% head()
+```
+
+
+- drop duplicates
+```{r}
+feature_data <- dplyr::distinct(feature_data, PROBEID, .keep_all = TRUE)
+```
+
+- filter `norm_data` and assign feature data to it:
+```{r}
+norm_data <- norm_data[feature_data$PROBEID, ]
+
+if (any(feature_data$PROBEID != featureNames(norm_data)))
+  stop("Feature data mismatch.")
+
+fData(norm_data) <- feature_data
+annotation(norm_data) <- "mogene20sttranscriptcluster.db"
+```
+
+
+
+- some genes are targeted by multiple probes (if we take ENSEMBL ID as unique identifier):
+```{r}
+janitor::get_dupes(fData(norm_data), ENSEMBL) %>% head(10)
+```
+
+
+- mouse genes annotation:
+```{r}
+# 58 % not annotated
+# 41 % is annotated
+table(is.na(fData(norm_data)$ENSEMBL))
+```
+
+
+***
+# Explanatory analysis (Biological quality control)
+
+### Histogram, PCA plot  
+
+```{r}
+pData(norm_data)
+groups <- pData(norm_data)$factor_value_phenotype
+names(groups) <- sampleNames(norm_data)
+plot_hc(exprs(norm_data), color_by = groups, color_by_lab = "Sample Group")
+plot_pca(exprs(norm_data), sample_data = pData(norm_data), n_top_features = 1000, color_by = "factor_value_phenotype", plot_type = "multi")$plot
+```
+In factor_value_phenotype control means wild type
+
+The histogram well separated the control (wild type) from the other samples, the other samples are slightly mixed. 
+The same can be seen in the PCA plot (in the upper left plot and in the upper right plot), the control (wild type) is well separated, the other samples are mixed.
+
+
+
+### Heatmaps
+
+```{r}
+plot_heatmap(
+  exprs(norm_data)[1:1000, ],
+  z_score = TRUE,
+  sample_annotation = dplyr::select(pData(norm_data), factor_value_phenotype),
+  title = "Affymetrix",
+  legend_title = "z-score",
+  show_row_names = FALSE
+)
+```
+There is very random expression of genes, it's very chaotic, better is to take top N most variable probes.
+
+- expression matrix to contain only top N most variable probes:
+```{r}
+plot_heatmap(
+  exprs(norm_data),
+  n_top_features = 1000,
+  z_score = TRUE,
+  sample_annotation = dplyr::select(pData(norm_data), factor_value_phenotype),
+  title = "Affymetrix",
+  legend_title = "z-score",
+  show_row_names = FALSE
+)
+```
+Again, it can be see well separated the control (wild type).
+Next, what we can see is that genes in the wild type have some value but genes in other samples have opposite value. In other samples was knockout some genes that encode the tumor suppressors were turn off. This could lead to the development of cancer it means that some genes would have upregulation and some genes downregulation compared to wild type, and this can be seen on this heatmap.
+ 
+# Boxplots
+
+- convert `ExpressionSet` to the long format for boxplot
+
+```{r}
+data_long <- exprs(norm_data)[1:10, ] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("PROBEID") %>%
+  tidyr::pivot_longer(-PROBEID, names_to = "sample_name", values_to = "E") %>%
+  dplyr::left_join(fData(norm_data), by = "PROBEID") %>%
+  dplyr::left_join(pData(norm_data), by = "sample_name")
+
+head(data_long)
+```
+
+- boxplots
+
+```{r}
+plot_boxplots(
+  data_long,
+  x = "factor_value_phenotype",
+  y = "E",
+  facet_by = "SYMBOL",
+  color_by = "factor_value_phenotype",
+  main = "Affymetrix",
+  x_lab = "Sample_Group",
+  y_lab = "log2(expression intensity)",
+  do_t_test = FALSE
+) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+```
+I probably wouldn't say much here.
+
+
+***
+
+# Differential expression analysis (DEA)
+
+- DEA tells us which genes are differently expressed between conditions
+
+
+## limma
+
+- create the design matrix
+```{r}
+group <- pData(norm_data)$factor_value_phenotype %>% factor() %>% relevel("control")
+
+dea_model <- model.matrix(~ group)
+colnames(dea_model)[1] <- "Intercept"
+dea_model
+```
+
+- I take wild type as a control and cotnrol means the reference group
+- fit the model and use the empirical Bayes shrinkage - will basically improve parameter estimates in our model by "borrowing" information from other probes:
+```{r}
+fit <- lmFit(norm_data, dea_model) %>% eBayes()
+colnames(fit) 
+```
+
+
+
+- show differential expression statistics for each gene in a specific group
+
+### Control vs Acp_knockout
+
+```{r}
+df_table_Apc <- topTable(fit,n=Inf, coef = "groupApc_knockout")
+df_table_Apc <- data.frame(rbind(df_table_Apc))
+df_table_Apc <- dplyr::filter(df_table_Apc, !is.na(ENSEMBL))
+# df_table_Apc_eid <- df_table_Apc
+
+DT::datatable(df_table_Apc, escape = FALSE)
+```
+
+### Control vs Acp_Msx1_knockout
+
+```{r}
+df_table_Apc_Msx1 <- topTable(fit, n=Inf,coef = "groupApc_and_Msx1_knockout")
+df_table_Apc_Msx1 <- data.frame(rbind(df_table_Apc_Msx1))
+df_table_Apc_Msx1 <- dplyr::filter(df_table_Apc_Msx1, !is.na(ENSEMBL))
+# df_table_Apc_Msx_eid <- df_table_Apc_Msx1
+
+DT::datatable(df_table_Apc_Msx1, escape = FALSE)
+```
+
+
+
+## DEA between other sample groups
+
+- we have only two groups
+- comparison of two non-control groups
+- specification of contrasts (*groupApc_knockout* vs *Apc_and_Msx1_knockout*):
+
+```{r}
+contrasts <- makeContrasts(
+  Apc_knockout_vs_Apc_Msx1_knockout =  groupApc_knockout - groupApc_and_Msx1_knockout,
+  levels = dea_model
+)
+
+contrasts
+```
+
+
+- refit model using defined contrasts:
+
+```{r}
+fit_c <- contrasts.fit(fit, contrasts = contrasts) %>% eBayes()
+df_table_dif <- topTable(fit_c,n=Inf, coef = "Apc_knockout_vs_Apc_Msx1_knockout",sort.by = "logFC")
+df_table_dif <- data.frame(rbind(df_table_dif))
+df_table_dif <- dplyr::filter(df_table_dif, !is.na(ENSEMBL))
+
+DT::datatable(df_table_dif, escape = FALSE)
+```
+
+
+
+## Custom reporting of DEGs
+
+***
+
+## Reports
+
+- HTML report table which shows DEA group results
+- links in HTML `semestral_project/repors/dea_signpost.html` not work in RStudio (RStudio create path which don't agree with link paths to the HTML group reports) 
+
+```{r, results = "asis"}
+# loop_contrasts(fit)
+```
+## Visualisation
+
+
+- filtrating of interesting genes
+
+```{r}
+res_Acp <- dplyr::filter(df_table_Apc, adj.P.Val < 0.1 & abs(logFC) > 1 & !(is.na(ENSEMBL)))
+res_Acp 
+res_Acp_Msx1 <-  dplyr::filter(df_table_Apc_Msx1, adj.P.Val < 0.1 & abs(logFC) > 1& !(is.na(ENSEMBL)))
+res_Acp_Msx1
+```
+
+### Heatmap
+
+- used filter data
+
+#### Knockout Acp 
+
+```{r}
+selected <- rownames(res_Acp)
+
+plot_heatmap(
+  exprs(norm_data[selected,]),
+  z_score = TRUE,
+  sample_annotation = dplyr::select(pData(norm_data), factor_value_phenotype),
+  title = "Affymetrix",
+  legend_title = "z-score",
+  show_row_names = FALSE
+)
+```
+Here it can be seen genes with significant gene expression (knockout Acp).
+
+
+#### Knockout Acp and Msx1 
+
+```{r}
+selected <- rownames(res_Acp_Msx1)
+
+plot_heatmap(
+  exprs(norm_data[selected,]),
+  z_score = TRUE,
+  sample_annotation = dplyr::select(pData(norm_data), factor_value_phenotype),
+  title = "Affymetrix",
+  legend_title = "z-score",
+  show_row_names = FALSE
+)
+```
+
+
+
+### Volcano plot
+
+- used unfiltered data
+
+#### Knockout Acp 
+
+```{r}
+EnhancedVolcano::EnhancedVolcano(
+  toptable = df_table_Apc,
+  lab = df_table_Apc$SYMBOL,
+  x="logFC",
+  y ="adj.P.Val",
+  selectLab = df_table_Apc[1:50,"SYMBOL"],
+  pCutoff = 0.05,
+  FCcutoff = 0.7,
+  title='Volcano plot',
+  subtitle = 'group Apc knockout',
+  ylab='-log(adj p-value)',
+  drawConnectors = TRUE
+)
+```
+
+Volcano plot shows genes and boundary of cutoff for logFC and -log(adj p-value). The insteresting genes are located in the upper left or upper right.
+
+
+
+#### Knockout Acp and Msx1 
+
+```{r}
+EnhancedVolcano::EnhancedVolcano(
+  toptable = df_table_Apc_Msx1,
+  lab = df_table_Apc_Msx1$SYMBOL,
+  x="logFC",
+  y ="adj.P.Val",
+  selectLab = df_table_Apc_Msx1[1:50,"SYMBOL"],
+  pCutoff = 0.05,
+  FCcutoff = 0.7,
+  title='Volcano plot',
+  subtitle = 'group Apc knockout',
+  ylab='-log(adj p-value)',
+  drawConnectors = TRUE
+)
+```
+Volcano plot shows genes and boundary of cutoff for logFC and -log(adj p-value). The insteresting genes are located in the upper left or upper right.
+
+
+
+#### DEA between other groups
+
+```{r}
+EnhancedVolcano::EnhancedVolcano(
+  toptable = df_table_dif,
+  lab = df_table_Apc$SYMBOL,
+  x="logFC",
+  y ="adj.P.Val",
+  selectLab = df_table_Apc[1:50,"SYMBOL"],
+  pCutoff = 0.05,
+  FCcutoff = 0.7,
+  title='Volcano plot',
+  subtitle = 'group Apc knockout',
+  ylab='-log(adj p-value)',
+  drawConnectors = TRUE
+)
+```
+This is volcano plot for DEA between other groups (knockout_Acp vs knockout_Acp_Msx1).
+
+
+
+
+
+#	Gene Set Enrichment Analysis
+
+
+#### Knockout Acp 
+
+- preprocessing data
+- sorted in decreasing order for GSEA
+
+```{r}
+entrez_wald_Acp <- as.numeric(df_table_Apc$t)
+names(entrez_wald_Acp) <- df_table_Apc$ENTREZID
+
+# Sort by decreasing Wald statistic.
+any(duplicated(df_table_Apc$ENTREZID))
+entrez_wald_Acp <- entrez_wald_Acp[order(entrez_wald_Acp, decreasing = TRUE)]
+```
+```{r}
+entrez_lfc_Acp <- df_table_Apc$logFC
+names(entrez_lfc_Acp) <- df_table_Apc$ENTREZID
+entrez_lfc_Acp <- entrez_lfc_Acp[order(entrez_lfc_Acp, decreasing = TRUE)]
+```
+
+
+
+- run GSEA on KEGG pathways:
+```{r}
+gsea_kegg_results_Acp <- gseKEGG(
+  geneList = entrez_wald_Acp,
+  # KEGG organism ID - mus musculus
+  organism = "mmu",
+  # Key type is ENTREZ ID.
+  keyType = "ncbi-geneid",
+  # Correct p-values for FDR.
+  pAdjustMethod = "fdr",
+  # FDR adjusted p-value threshold.
+  # We are OK with 10% of false positives among all pathways called significant.
+  pvalueCutoff = 0.1,
+  # Set a constant seed so you will get reproducible results using the same data.
+  seed = 1,
+  verbose = TRUE
+)
+```
+- results of GSEA
+```{r}
+gsea_kegg_results_Acp
+```
+
+
+```{r}
+as.data.frame(gsea_kegg_results_Acp)
+```
+
+
+- visualization of results
+
+```{r}
+gsea_kegg_results_Acp <- setReadable(gsea_kegg_results_Acp, "mogene20sttranscriptcluster.db", keyType = "ENTREZID")
+```
+
+
+
+### GSEA plot
+
+
+```{r}
+gseaplot2(gsea_kegg_results_Acp, geneSetID = 1:4, pvalue_table = TRUE, ES_geom = "dot")
+```
+The GSEA plot shows 3 biological pathways. The most significant is pathway: Ribosome biogenesis in eukarzotes then are Oxidative phosporylation, ...
+
+
+
+### Dotplot
+Dotplot shows how leading edge genes are distributed.
+
+GeneRatio: ratio of top scoring genes in a gene set.
+Count: number of top scoring genes in a gene set.
+
+```{r}
+enrichplot::dotplot(gsea_kegg_results_Acp, showCategory = 15, x = "GeneRatio", font.size = 10)
+```
+This graph shows, that for Ribosome has majority of genes before maximum in GSEA plot, significance enrichment score is higher and count define absolute number in leading edge subset. Next significant look pathway as Ribosome biogenesis in eukarzotes, Spliceosome, RNA transport,...
+
+
+### Gene-Concept Network
+
+- the cnetplot() function depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network
+
+```{r}
+p <- cnetplot(gsea_kegg_results_Acp, showCategory = 3, foldChange = entrez_lfc_Acp, colorEdge = TRUE)
+p
+p_file <- here("semestral_project/images/gsea_cnetplot_Acp.png")
+ggsave(p_file, p, device = "png", width = 10, height = 10)
+```
+
+### Gene-Concept Network in heatmap
+
+- Gene-Concept Network in a heatmap
+- show absent gene in pathway plus their logFC
+
+```{r}
+p <- heatplot(gsea_kegg_results_Acp, foldChange = entrez_lfc_Acp, showCategory = 3) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 2, size = 7))
+p
+p_file <- here("semestral_project/images/gsea_heatmap_Acp.png")
+ggsave(p_file, p, device = "png", width = 15, height = 5)
+```
+
+### Enrichment map
+
+- enrichment map organizes enriched terms into a network with edges connecting overlapping gene sets. In this way, mutually overlapping gene sets are tend to cluster together, making it easy to identify functional module
+- don't show genes but zoom on overlap between pathway
+
+```{r}
+gsea_kegg_results_Acp <- pairwise_termsim(gsea_kegg_results_Acp)
+emapplot(gsea_kegg_results_Acp, color = "NES", showCategory = 10)
+```
+### PubMed Central plot
+- popularity of gene sets in articles
+
+```{r}
+terms_Acp <- gsea_kegg_results_Acp$Description[1:4]
+p_Acp <- pmcplot(terms_Acp, 2010:2017)
+p2_Acp <- pmcplot(terms_Acp, 2010:2017, proportion = FALSE)
+patchwork::wrap_plots(p_Acp, p2_Acp, ncol = 2, guides = "collect")
+```
+
+
+
+#### Knockout Acp and Msx1
+
+- preprocessing data
+- sorted in decreasing order for GSEA
+
+```{r}
+entrez_wald_Acp_Msx1 <- as.numeric(df_table_Apc_Msx1$t)
+names(entrez_wald_Acp_Msx1) <- df_table_Apc_Msx1$ENTREZID
+
+# Sort by decreasing Wald statistic.
+entrez_wald_Acp_Msx1 <- entrez_wald_Acp_Msx1[order(entrez_wald_Acp_Msx1, decreasing = TRUE)]
+```
+
+```{r}
+entrez_lfc_Acp_Msx1 <- df_table_Apc_Msx1$logFC
+names(entrez_lfc_Acp_Msx1) <- df_table_Apc_Msx1$ENTREZID
+entrez_lfc_Acp_Msx1 <- entrez_lfc_Acp_Msx1[order(entrez_lfc_Acp_Msx1, decreasing = TRUE)]
+```
+
+
+- run GSEA on KEGG pathways:
+```{r}
+gsea_kegg_results_Acp_Msx1 <- gseKEGG(
+  geneList = entrez_wald_Acp_Msx1,
+  # KEGG organism ID - mus musculus
+  organism = "mmu",
+  # Key type is ENTREZ ID.
+  keyType = "ncbi-geneid",
+  # Correct p-values for FDR.
+  pAdjustMethod = "fdr",
+  # FDR adjusted p-value threshold.
+  # We are OK with 10% of false positives among all pathways called significant.
+  pvalueCutoff = 0.1,
+  # Set a constant seed so you will get reproducible results using the same data.
+  seed = 1,
+  verbose = TRUE
+)
+```
+- results of GSEA
+```{r}
+gsea_kegg_results_Acp_Msx1
+```
+
+
+```{r}
+as.data.frame(gsea_kegg_results_Acp_Msx1)
+```
+
+- visualization of results
+
+```{r}
+gsea_kegg_results_Acp_Msx1 <- setReadable(gsea_kegg_results_Acp_Msx1, "mogene20sttranscriptcluster.db", keyType = "ENTREZID")
+```
+
+
+### GSEA plot
+
+```{r}
+gseaplot2(gsea_kegg_results_Acp_Msx1, geneSetID = 1:4, pvalue_table = TRUE, ES_geom = "dot")
+```
+The GSEA plot shows 3 biological pathways. The most significant is pathway: Ribosome biogenesis in eukaryotes then are Ribosome, Oxidative phosphorylation, ...
+
+
+### Dotplot
+
+GeneRatio: ratio of top scoring genes in a gene set.
+Count: number of top scoring genes in a gene set.
+
+```{r}
+enrichplot::dotplot(gsea_kegg_results_Acp_Msx1, showCategory = 15, x = "GeneRatio", font.size = 10)
+```
+This plot has similar results as a plot above for group without Acp vs control. Only ribosome changed place with DNA replication and some gene changed value of p.adjust. 
+
+
+
+
+### Gene-Concept Network
+
+- the cnetplot() function depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network
+
+```{r}
+p <- cnetplot(gsea_kegg_results_Acp_Msx1, showCategory = 4, foldChange = entrez_lfc_Acp_Msx1, colorEdge = TRUE)
+p
+p_file <- here("semestral_project/images/gsea_cnetplot_Acp_Msx1.png")
+ggsave(p_file, p, device = "png", width = 20, height = 20)
+```
+
+### Gene-Concept Network in heatmap
+
+- Gene-Concept Network in a heatmap
+- show absent gene in pathway plus their logFC
+
+```{r}
+p <- heatplot(gsea_kegg_results_Acp_Msx1, foldChange = entrez_lfc_Acp_Msx1, showCategory =3) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 2, size = 7))
+p
+p_file <- here("semestral_project/images/gsea_heatmap_Acp_Msx1.png")
+ggsave(p_file, p, device = "png", width = 15, height = 5)
+```
+
+### Enrichment map
+- enrichment map organizes enriched terms into a network with edges connecting overlapping gene sets. In this way, mutually overlapping gene sets are tend to cluster together, making it easy to identify functional module
+- don't show genes but zoom on overlap between pathway
+
+```{r}
+gsea_kegg_results_Acp_Msx1 <- pairwise_termsim(gsea_kegg_results_Acp_Msx1)
+emapplot(gsea_kegg_results_Acp_Msx1, color = "NES", showCategory = 13)
+```
+### PubMed Central plot
+- popularity of gene sets in articles
+
+```{r}
+terms_Acp_Msx1 <- gsea_kegg_results_Acp_Msx1$Description[1:4]
+p_Acp_Msx1 <- pmcplot(terms_Acp_Msx1, 2010:2017)
+p2_Acp_Msx1 <- pmcplot(terms_Acp_Msx1, 2010:2017, proportion = FALSE)
+patchwork::wrap_plots(p2_Acp_Msx1, p2_Acp_Msx1, ncol = 2, guides = "collect")
+```
+
+
+
+
+## Signaling pathway impact analysis (SPIA)
+
+- estimate the effect of changes in gene expression on the activity of that pathway
+
+
+- download data
+
+
+```{r}
+PADJ_THRESHOLD <- 0.1
+LFC_THRESHOLD <- 1
+```
+
+
+```{r}
+KEGG_DATA_DIR <- here("semestral_project/kegg_data_Acp")
+dir.create(KEGG_DATA_DIR)
+kegg_ids <- gsea_kegg_results_Acp@result$ID[1:20]
+purrr::map(kegg_ids, ~ download.file(glue("http://rest.kegg.jp/get/{.}/kgml"), glue("{KEGG_DATA_DIR}/{.}.xml")))
+```
+- prepared for SPIA
+```{r}
+makeSPIAdata(
+  kgml.path = KEGG_DATA_DIR,
+  organism = "mmu",
+  out.path = KEGG_DATA_DIR
+)
+```
+- SPIA needs a named vector as input, needs LFCs od DEGs
+
+```{r}
+top<-df_table_Apc[!is.na(df_table_Apc$ENTREZ),]
+top<-top[!is.na(top$ENTREZ),]
+top<-top[!duplicated(top$ENTREZ),]
+tg1<-top[top$adj.P.Val<PADJ_THRESHOLD,]
+tg1<-tg1[abs(tg1$logFC)>LFC_THRESHOLD,]
+
+entrez_lfc_deg=tg1$logFC
+names(entrez_lfc_deg)<-as.vector(tg1$ENTREZ)
+
+entrez_lfc_deg <- entrez_lfc_deg[order(entrez_lfc_deg, decreasing = TRUE)]
+
+all_entrez=top$ENTREZ
+```
+
+
+- run SPIA:
+```{r}
+spia_results <- spia(
+  de = entrez_lfc_deg,
+  all = all_entrez,
+  organism = "mmu",
+  data.dir = paste0(KEGG_DATA_DIR, "/")
+)
+```
+
+```{r}
+spia_results
+```
+
+### Two-evidence plot:
+
+```{r}
+plotP(spia_results, threshold = 0.3)
+```
+
+Two way evidence plot shows pathwy as points with number. Blue and red lne define boundaries when pathways located at the top right from this boundaries they are interesting. in this case we can see, that two pathway lies right would be pathway with id 05150 (Staphylococcus), 05202 (Transcriptional misregulation in cancer), then next interesting is pathway with id 05166 (Human T-cell leukemia virus 1 infection),... 
+
+Viewing data in KEGG
+Pathview is a great package for generation of colorized KEGG pathways. It can also download KGML files and store them for later.
+```{r}
+pathway_id <- spia_results$ID[3]
+pathview_out_file <- glue("{pathway_id}.pathview.png")
+print(paste(KEGG_DATA_DIR,"/",pathview_out_file))
+
+pathview(
+  # A named vector of LFCs to color pathway by.
+  gene.data = entrez_lfc_deg,
+  # We use the first most significant pathway from GSEA.
+  pathway.id = pathway_id,
+  species = "mmu",
+  # Coloring range <min LFC; max LFC>
+  limit = list(gene = max(abs(entrez_lfc_deg)), cpd = 1),
+  kegg.dir = paste0(KEGG_DATA_DIR, "/")
+)
+```
+
+
+### Pro Acp a Msx1 knockout
+
+```{r}
+KEGG_DATA_DIR <- here("semestral_project/kegg_data_Acp_Msx1")
+dir.create(KEGG_DATA_DIR)
+kegg_ids_Acp_Msx1 <- gsea_kegg_results_Acp_Msx1@result$ID[1:20]
+purrr::map(kegg_ids_Acp_Msx1, ~ download.file(glue("http://rest.kegg.jp/get/{.}/kgml"), glue("{KEGG_DATA_DIR}/{.}.xml")))
+```
+
+Then KGML files need to be prepared for SPIA, simply by an included function which will save processed data in Rds format.
+```{r}
+makeSPIAdata(
+  kgml.path = KEGG_DATA_DIR,
+  organism = "mmu",
+  out.path = KEGG_DATA_DIR
+)
+```
+
+
+- SPIA needs a named vector as input, needs LFCs od DEGs
+
+```{r}
+top<-df_table_Apc_Msx1[!is.na(df_table_Apc_Msx1$ENTREZ),]
+top<-top[!is.na(top$ENTREZ),]
+top<-top[!duplicated(top$ENTREZ),]
+tg1<-top[top$adj.P.Val<PADJ_THRESHOLD,]
+tg1<-tg1[abs(tg1$logFC)>LFC_THRESHOLD,]
+
+entrez_lfc_deg_Acp_Msx1<-tg1$logFC
+names(entrez_lfc_deg_Acp_Msx1)<-as.vector(tg1$ENTREZ)
+
+entrez_lfc_deg_Acp_Msx1 <- entrez_lfc_deg_Acp_Msx1[order(entrez_lfc_deg_Acp_Msx1, decreasing = TRUE)]
+
+all_entrez=top$ENTREZ
+```
+
+
+- run SPIA:
+```{r}
+spia_results <- spia(
+  de = entrez_lfc_deg_Acp_Msx1,
+  all = all_entrez,
+  organism = "mmu",
+  data.dir = paste0(KEGG_DATA_DIR, "/")
+)
+```
+
+
+
+```{r}
+spia_results
+```
+
+
+### Two-evidence plot:
+
+```{r}
+plotP(spia_results, threshold = 0.3)
+```
+
+In this case there are interesting pathways with id 05150 (Staphylococus- inhibition), 05202 (Transcriptional misregulation in cancer - inhibition), , 051666 (Human T-cell leukemia virus -inhibice), 04310 (Wnt signaling pathway - inhibice), ... 
+
+```{r}
+# pathway_id <- gsea_kegg_results_Acp_Msx1$ID[3]
+pathway_id <- spia_results$ID[4]
+pathview_out_file <- glue("{pathway_id}.pathview.png")
+
+pathview(
+  # A named vector of LFCs to color pathway by.
+  gene.data = entrez_lfc_deg_Acp_Msx1,
+  # We use the first most significant pathway from GSEA.
+  pathway.id = pathway_id,
+  species = "mmu",
+  # Coloring range <min LFC; max LFC>
+  # limit = list(gene = max(abs(entrez_lfc_deg)), cpd = 1),
+  kegg.dir = paste0(KEGG_DATA_DIR, "/")
+)
+```
+
+# Conclusion
+
+This experiment was about colorectal cancer where were knockout genes that somehow affect this process. These were wild type as a control and there were mice with knockout Apc gene and then mice with knockout Apc and Msx1. 
+
+In general, this experiment was performed well according to the results of the Technical quality control, for Exploratory analysis it was seen that these two groups were not well separable by used models. 
+
+Differential expression analysis DEA find quite enough genes that were significant (several hundred) which might be fine. In cancer, multiple genes has different expression.
+In Gene set enrichment analysis for GSEA,  I probably wouldn't be able to tell exactly what's going on , but SPIA was more specific, there was infection (which probably happens often), but then there were some pathways on cancer and Wnt pathway, which is related to the knockout of Apc gene. Both groups (mice with knockout Apc gene and mice with knockout Apc and Msx1 gene) hve similar results for GSEA and SIA.
+
+
+# Cleanup
+
+All R objects can be saved in Rds format with `saveRDS()`, and loaded with `readRDS()`.
+We save the `norm_data` and `fit` objects, because you will use them in the assignment:
+
+```{r}
+saveRDS(norm_data, file = here(BASE_DIR, "norm_data.Rds"))
+saveRDS(fit, here(BASE_DIR, "fit.Rds"))
+```
+
+```{r, warning = TRUE, message = TRUE}
+save.image(here(BASE_DIR, "semestral_project.RData"))
+
+warnings()
+traceback()
+sessioninfo::session_info()
+```
+
+***
+***
+
+# HTML rendering
+
+This chunk is not evaluated (`eval = FALSE`). Otherwise you will probably end up in recursive hell `r emo::ji("exploding_head")`
+
+```{r, eval = FALSE, message = FALSE, warning = FALSE}
+library(conflicted)
+library(knitr)
+library(here)
+
+if (!require(rmdformats)) {
+  BiocManager::install("rmdformats")
+}
+
+# You can set global chunk options. Options set in individual chunks will override this.
+opts_chunk$set(warning = FALSE, message = FALSE, eval = TRUE)
+rmarkdown::render(here("semestral_project/semestral_project.Rmd"), output_file = here("semestral_project/semestral_project.html"), envir = new.env())
+```
